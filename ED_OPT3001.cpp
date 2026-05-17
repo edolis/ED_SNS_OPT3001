@@ -1,7 +1,7 @@
 #include "ED_OPT3001.h"
 #include <cmath>
-#include "esp_check.h"
 #include "freertos/portmacro.h"
+#include "esp_check.h"
 
 namespace ED_OPT3001 {
 
@@ -34,6 +34,10 @@ esp_err_t OPT3001::readRegister(uint8_t reg, uint16_t& value) const {
 // ---------------------------------------------------------------------
 // Lux / register conversion
 // ---------------------------------------------------------------------
+float OPT3001::convertRawToLux(uint16_t rawRegister) {
+    return registerToFloat(rawRegister);  // reuse private helper
+}
+
 uint8_t OPT3001::lsbFromLux(float lux) {
     uint8_t exp = 0;
     while (lux > (40.95f * (1 << exp)) && exp < 0x0B) exp++;
@@ -102,8 +106,6 @@ esp_err_t OPT3001::getThresholds(float& lowLux, float& highLux) const {
 // End‑Of‑Conversion interrupt mode
 // ---------------------------------------------------------------------
 esp_err_t OPT3001::enableEOCInterrupt() const {
-    // According to OPT3001 datasheet: set Low Limit register to 0xC000 (or 0xC000 plus mantissa)
-    // We use the simplest form: 0xC000 (LE[3:2]=11, exponent=0, mantissa=0)
     uint16_t eoc_code = 0xC000;
     return writeRegister(LOW_LIMIT_REG, eoc_code);
 }
@@ -149,9 +151,98 @@ esp_err_t OPT3001::setLatch(uint8_t latch) const {
     return configure(cfg);
 }
 
+esp_err_t OPT3001::setFaultCount(uint8_t count) const {
+    ConfigReg cfg{};
+    esp_err_t err = getConfig(cfg);
+    if (err != ESP_OK) return err;
+    // Convert user count (1,2,4,8) to field value
+    uint8_t fc;
+    switch (count) {
+        case 1:  fc = FAULT_COUNT_1; break;
+        case 2:  fc = FAULT_COUNT_2; break;
+        case 4:  fc = FAULT_COUNT_4; break;
+        case 8:  fc = FAULT_COUNT_8; break;
+        default: return ESP_ERR_INVALID_ARG;
+    }
+    cfg.fault_count_field = fc;
+    return configure(cfg);
+}
+
+esp_err_t OPT3001::setMaskExponent(bool enable) const {
+    ConfigReg cfg{};
+    esp_err_t err = getConfig(cfg);
+    if (err != ESP_OK) return err;
+    cfg.mask_exponent_field = enable ? 1 : 0;
+    return configure(cfg);
+}
+
+esp_err_t OPT3001::setFullScaleRange(uint8_t range) const {
+    if (range > RN_AUTO && range != RN_AUTO) {
+        ESP_LOGE(TAG, "Invalid range %u, must be 0..11 or RN_AUTO (12)", range);
+        return ESP_ERR_INVALID_ARG;
+    }
+    ConfigReg cfg{};
+    esp_err_t err = getConfig(cfg);
+    if (err != ESP_OK) return err;
+    cfg.range_number_field = range & 0x0F;
+    return configure(cfg);
+}
+
+esp_err_t OPT3001::setAutoRange(bool enable) const {
+    return setFullScaleRange(enable ? RN_AUTO : RN_MANUAL_MIN);
+}
+
 // ---------------------------------------------------------------------
-// Read lux
+// Status flags
 // ---------------------------------------------------------------------
+esp_err_t OPT3001::getOverflowFlag(bool& overflow) const {
+    ConfigReg cfg{};
+    esp_err_t err = getConfig(cfg);
+    if (err != ESP_OK) return err;
+    overflow = (cfg.overflow_flag != 0);
+    return ESP_OK;
+}
+
+esp_err_t OPT3001::isConversionReady(bool& ready) const {
+    ConfigReg cfg{};
+    esp_err_t err = getConfig(cfg);
+    if (err != ESP_OK) return err;
+    ready = (cfg.conversion_ready != 0);
+    return ESP_OK;
+}
+
+esp_err_t OPT3001::getFlagHigh(bool& high) const {
+    ConfigReg cfg{};
+    esp_err_t err = getConfig(cfg);
+    if (err != ESP_OK) return err;
+    high = (cfg.high_field_flag != 0);
+    return ESP_OK;
+}
+
+esp_err_t OPT3001::getFlagLow(bool& low) const {
+    ConfigReg cfg{};
+    esp_err_t err = getConfig(cfg);
+    if (err != ESP_OK) return err;
+    low = (cfg.low_field_flag != 0);
+    return ESP_OK;
+}
+
+// ---------------------------------------------------------------------
+// Raw result access
+// ---------------------------------------------------------------------
+esp_err_t OPT3001::readRawResult(uint8_t& exponent, uint16_t& mantissa) const {
+    uint16_t raw;
+    esp_err_t err = readRegister(RESULT_REG, raw);
+    if (err != ESP_OK) return err;
+    exponent = (raw >> 12) & 0x0F;
+    mantissa = raw & 0x0FFF;
+    return ESP_OK;
+}
+
+esp_err_t OPT3001::getResultRegister(uint16_t& raw) const {
+    return readRegister(RESULT_REG, raw);
+}
+
 esp_err_t OPT3001::readLux(float& lux) const {
     uint16_t raw = 0;
     esp_err_t err = readRegister(RESULT_REG, raw);
@@ -176,6 +267,20 @@ esp_err_t OPT3001::getDeviceID(uint16_t& id) const {
 }
 
 // ---------------------------------------------------------------------
+// Interrupt edge helper
+// ---------------------------------------------------------------------
+gpio_int_type_t OPT3001::getInterruptEdge() const {
+    ConfigReg cfg{};
+    if (getConfig(cfg) != ESP_OK) {
+        // Default to falling edge if we cannot read polarity
+        return GPIO_INTR_NEGEDGE;
+    }
+    // Active low → falling edge triggers interrupt
+    // Active high → rising edge triggers interrupt
+    return (cfg.polarity_field == INT_ACTIVE_LOW) ? GPIO_INTR_NEGEDGE : GPIO_INTR_POSEDGE;
+}
+
+// ---------------------------------------------------------------------
 // Interrupt handling
 // ---------------------------------------------------------------------
 esp_err_t OPT3001::enableInterrupt(EventGroupHandle_t evtGroup, EventBits_t bitMask) {
@@ -186,13 +291,16 @@ esp_err_t OPT3001::enableInterrupt(EventGroupHandle_t evtGroup, EventBits_t bitM
     evt_group_ = evtGroup;
     evt_bit_   = bitMask;
 
+    // Determine interrupt edge from current polarity setting
+    gpio_int_type_t edge = getInterruptEdge();
+
     // Configure GPIO as input with pull‑up (INT is open‑drain)
     gpio_config_t io_conf = {
         .pin_bit_mask = 1ULL << int_gpio_,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_NEGEDGE,
+        .intr_type = edge,
     };
     esp_err_t err = gpio_config(&io_conf);
     if (err != ESP_OK) return err;

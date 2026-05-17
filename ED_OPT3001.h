@@ -4,7 +4,7 @@
  * @brief library for the TI OPT3001 luminosity sensor
  *
  * @author Emanuele Dolis (edoliscom@gmail.com)
- * @version 0.2
+ * @version 0.3
  * @date 2026-05-17
  */
 // #endregion
@@ -33,10 +33,10 @@ public:
     static constexpr uint16_t MANUFACTURER_ID = 0x5449;
     static constexpr uint16_t DEVICE_ID       = 0x3001;
 
-    // Ranging mode (always automatic)
-    static constexpr uint16_t RN_AUTO = 0x0C;
+    static constexpr uint8_t RN_MANUAL_MIN = 0x00;
+    static constexpr uint8_t RN_MANUAL_MAX = 0x0B;
+    static constexpr uint8_t RN_AUTO       = 0x0C;
 
-    // Conversion modes
     enum ConversionMode : uint8_t {
         LOWPOWER     = 0x00,
         SINGLE_SHOT  = 0x01,
@@ -44,25 +44,28 @@ public:
         CONTINUOUS_B = 0x03
     };
 
-    // Conversion times
     enum ConversionTime : uint8_t {
         TIME_100MS = 0x00,
         TIME_800MS = 0x01
     };
 
-    // Interrupt polarity
     enum Polarity : uint8_t {
         INT_ACTIVE_LOW  = 0x00,
         INT_ACTIVE_HIGH = 0x01
     };
 
-    // Latch styles
     enum Latch : uint8_t {
-        LATCH_TRANSPARENT = 0x00,   // auto‑clearing when light returns within limits
-        LATCH_WINDOW      = 0x01    // stays asserted until config or result register is read
+        LATCH_TRANSPARENT = 0x00,
+        LATCH_WINDOW      = 0x01
     };
 
-    // === Config register bitfield ===
+    enum FaultCount : uint8_t {
+        FAULT_COUNT_1 = 0x00,
+        FAULT_COUNT_2 = 0x01,
+        FAULT_COUNT_4 = 0x02,
+        FAULT_COUNT_8 = 0x03
+    };
+
     union ConfigReg {
         uint16_t config_register;
         struct {
@@ -80,73 +83,66 @@ public:
         };
     };
 
-    // === Construction & device setup ===
-    /**
-     * @brief Construct a new OPT3001 object
-     * @param dev I2C master device handle (obtained from I2CBus::get_device)
-     * @param intPin GPIO number for interrupt pin (optional, set to GPIO_NUM_NC if not used)
-     */
+    // === Construction ===
     OPT3001(i2c_master_dev_handle_t dev, gpio_num_t intPin = GPIO_NUM_NC);
 
-    // No static addDevice() – use I2CBus::get_device instead.
-
-    // === Basic operations ===
+    // === Core API ===
+static float convertRawToLux(uint16_t rawRegister);   // convert raw 16-bit register value to lux
     esp_err_t configure(const ConfigReg& cfg) const;
     esp_err_t getConfig(ConfigReg& cfg) const;
-    esp_err_t readLux(float& lux) const;   // returns ESP_OK and fills lux
-    esp_err_t readRaw(uint8_t reg, uint16_t& out) const;
+    esp_err_t readLux(float& lux) const;
+    esp_err_t readRawResult(uint8_t& exponent, uint16_t& mantissa) const;
+    esp_err_t getResultRegister(uint16_t& raw) const;
+    esp_err_t readRaw(uint8_t reg, uint16_t& out) const;   // <-- ADDED
 
-    // === Threshold & interrupt control ===
-    esp_err_t setThresholds(float lowLux, float highLux) const;   // normal window mode
+    // === Thresholds & EOC ===
+    esp_err_t setThresholds(float lowLux, float highLux) const;
     esp_err_t getThresholds(float& lowLux, float& highLux) const;
-    esp_err_t enableEOCInterrupt() const;                         // End‑Of‑Conversion mode
-    esp_err_t disableEOCInterrupt(float restoreLowLux) const;     // back to normal thresholds
+    esp_err_t enableEOCInterrupt() const;
+    esp_err_t disableEOCInterrupt(float restoreLowLux) const;
 
     // === Configuration helpers ===
     esp_err_t setMode(uint8_t conversion_mode) const;
     esp_err_t setConversionTime(uint8_t conv_time) const;
     esp_err_t setPolarity(uint8_t polarity) const;
     esp_err_t setLatch(uint8_t latch) const;
+    esp_err_t setFaultCount(uint8_t count) const;
+    esp_err_t setMaskExponent(bool enable) const;
+    esp_err_t setFullScaleRange(uint8_t range) const;
+    esp_err_t setAutoRange(bool enable) const;
 
-    // === Device identification ===
+    // === Status flags ===
+    esp_err_t getOverflowFlag(bool& overflow) const;
+    esp_err_t isConversionReady(bool& ready) const;
+    esp_err_t getFlagHigh(bool& high) const;
+    esp_err_t getFlagLow(bool& low) const;
+
+    // === Device ID ===
     esp_err_t getManufacturerID(uint16_t& id) const;
     esp_err_t getDeviceID(uint16_t& id) const;
 
-    // === Interrupt handling (GPIO) ===
-    /**
-     * @brief Enable interrupt on INT pin (falling edge only)
-     * @param evtGroup FreeRTOS event group to signal
-     * @param bitMask  Bit mask to set when interrupt occurs
-     */
+    // === Interrupt ===
     esp_err_t enableInterrupt(EventGroupHandle_t evtGroup, EventBits_t bitMask);
-
-    /**
-     * @brief Disable interrupt (remove ISR handler)
-     */
     esp_err_t disableInterrupt();
 
 private:
     i2c_master_dev_handle_t dev_;
     gpio_num_t int_gpio_;
-
-    // Interrupt runtime data
     EventGroupHandle_t evt_group_ = nullptr;
     EventBits_t        evt_bit_   = 0;
     bool               isr_enabled_ = false;
 
-    // Low‑level register access
     esp_err_t writeRegister(uint8_t reg, uint16_t value) const;
-    esp_err_t readRegister(uint8_t reg, uint16_t& value) const;
+    esp_err_t readRegister(uint8_t reg, uint16_t& value) const;   // <-- private
 
-    // Lux ↔ register conversion
     static uint8_t  lsbFromLux(float lux);
     static uint16_t floatToRegister(float lux);
     static float    registerToFloat(uint16_t reg);
 
-    // ISR trampoline
+    gpio_int_type_t getInterruptEdge() const;
     static void IRAM_ATTR isr_trampoline(void* arg);
 
-    static constexpr TickType_t TIMEOUT_MS = 1000;  // 1 second timeout for I2C
+    static constexpr TickType_t TIMEOUT_MS = 1000;
 };
 
 } // namespace ED_OPT3001
